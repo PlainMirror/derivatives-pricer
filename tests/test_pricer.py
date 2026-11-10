@@ -1,11 +1,14 @@
 """Checks for pricer.py: the CRR tree against Black-Scholes, the call-side fixes, and golden put prices.
 
-Run from this folder with `py test_pricer.py` (or `pytest test_pricer.py`). No market data needed.
+Run with `python tests/test_pricer.py` (or `pytest tests`). No market data needed.
 """
 import math
+import os
 import sys
 
 from scipy.special import ndtr
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pricer import bin_tree, iv, strike_for_delta
 
