@@ -1,16 +1,18 @@
-"""Binomial option pricer and a daily back test of selling SPY options against a share position.
+"""Binomial option pricer and a daily back test of selling SPY options.
 
     python pricer.py                      # 2010 to today: delta x DTE sweep, then one run in detail
-    python pricer.py --start 2022-01-01 --end 2022-12-31
+    python pricer.py --legacy             # the original model: CRR tree, 50 steps, VIX as ATM vol, flat skew
+    python pricer.py --collateral cash    # cash-secured puts instead of puts sold against a share position
 
 Three parts:
-  vol model   at-the-money vol from VIX9D and VIX, interpolated in total variance, plus a linear skew
-  pricer      vectorised Cox-Ross-Rubinstein tree with early exercise
-  back test   holds SPY, sells a put (or a covered call) at a target delta and days to expiry, marks it
-              to market every day, and closes on a profit target, a loss cap or expiry
+  vol model   at-the-money vol from VIX9D and VIX, interpolated in total variance, scaled to the
+              at-the-money level of a real SPY chain, with a smile fitted to that chain
+  pricer      Leisen-Reimer binomial tree (201 steps) with early exercise; Cox-Ross-Rubinstein kept
+  back test   sells a put (or a covered call) at a target delta and days to expiry, marks it to market
+              every day, and closes it on a profit target, a stop, a time exit or expiry
 
-Every option price in the back test comes from the vol model, not from quotes. validate_surface.py
-measures how far that model is from a real SPY chain.
+Every option price in the back test comes from the vol model, not from quotes. smile_fit.py fits the
+model to a real SPY chain and checks it on expiries it was not fitted on.
 """
 import argparse
 import math
@@ -22,16 +24,36 @@ import pandas as pd
 from scipy.special import ndtr, ndtri
 
 warnings.filterwarnings("ignore")
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(ROOT, "out")
+CACHE = os.path.join(ROOT, "cache")
+
+# ------------------------------------------------------------------ settings
+# Every modelling choice in one place. LEGACY reproduces the original model, which the golden
+# tests in tests/test_pricer.py pin down.
+MODEL = {"tree": "lr", "steps": 201, "smile": "fitted", "atm_scale": 0.812}
+LEGACY = {"tree": "crr", "steps": 50, "smile": "linear", "atm_scale": 1.0}
+
+# Linear skew of the original model: slope of vol against log-strike, at VIX 20.
+SKEW_BASE = 0.30
+
+# Fitted smile, in standardised moneyness x = ln(K/F) / (sigma_atm * sqrt(T)), one quadratic per side:
+#     sigma(x) = sigma_atm * (1 + B1 x + B2 x^2)    below the forward (the put wing)
+#     sigma(x) = sigma_atm * (1 + C1 x + C2 x^2)    above it
+# The coefficients and the at-the-money scale above are set by smile_fit.py from the SPY chain at
+# the 2026-09-24 close, using alternate expiries, and checked on the other half.
+SMILE_B1, SMILE_B2 = -0.1532, 0.0246
+SMILE_C1, SMILE_C2 = -0.2073, 0.1019
+SMILE_X_RANGE = (-4.0, 3.0)   # beyond the fitted strikes the shape is held flat, not extrapolated
+SMILE_FLOOR = 0.5             # vol never below half the at-the-money vol
 
 
 # ---------------------------------------------------------------- vol model
 def atm_vol(vix9d: float, vix: float, T_years: float) -> float:
-    """At-the-money vol for a maturity between 9 and 30 days.
+    """At-the-money vol for a maturity between 9 and 30 days, read straight off VIX9D and VIX.
 
-    VIX9D and VIX are 9-day and 30-day implied vols. Variance adds over time, so
-    the interpolation is linear in total variance (vol^2 x days), not in vol.
-    Outside 9 to 30 days the nearer index is used as is.
+    Variance adds over time, so the interpolation is linear in total variance (vol^2 x days),
+    not in vol. Outside 9 to 30 days the nearer index is used as is.
     """
     t = T_years * 365.0
     s9, s30 = vix9d / 100.0, vix / 100.0
@@ -43,49 +65,77 @@ def atm_vol(vix9d: float, vix: float, T_years: float) -> float:
     return math.sqrt(tv / t)
 
 
-# The two assumptions of the vol model. The defaults are the original ones. validate_surface.py
-# measures both against a real chain, and --atm-scale / --skew-base rerun the back test with other values.
-ATM_SCALE = 1.0     # at-the-money vol as a fraction of the VIX-based number above
-SKEW_BASE = 0.30    # slope of vol against log-strike when VIX is 20
-
-
-def model_atm(vix9d: float, vix: float, T_years: float) -> float:
-    return ATM_SCALE * atm_vol(vix9d, vix, T_years)
+def model_atm(vix9d: float, vix: float, T_years: float, model=None) -> float:
+    """VIX prices a strip of options across all strikes, expensive downside puts included, so in a
+    skewed market it sits above at-the-money vol. The scale corrects for that."""
+    m = model or MODEL
+    return m["atm_scale"] * atm_vol(vix9d, vix, T_years)
 
 
 def skew_slope(vix_level: float) -> float:
-    base_slope = SKEW_BASE           # assumed SPY skew; see SKEW_BASE
-    vol_scaling = vix_level / 20.0   # steeper skew in high-vol regimes
-    return base_slope * vol_scaling
+    """The original linear skew: slope of vol against log-strike, steeper when VIX is high."""
+    return SKEW_BASE * vix_level / 20.0
 
 
-def iv(S: float, K: float, T: float, sigma_atm: float, vix_level: float) -> float:
-    mon = math.log(K / S)
-    sig_K = sigma_atm - skew_slope(vix_level) * mon
-    return max(sig_K, 0.01)
+def iv(S: float, K: float, T: float, sigma_atm: float, vix_level: float,
+       r: float = 0.03, q: float = 0.012, model=None) -> float:
+    """Implied vol at strike K, given the at-the-money vol."""
+    m = model or MODEL
+    if m["smile"] == "linear":
+        return max(sigma_atm - skew_slope(vix_level) * math.log(K / S), 0.01)
+    if T <= 0:
+        return max(sigma_atm, 0.01)
+    F = S * math.exp((r - q) * T)
+    x = math.log(K / F) / (sigma_atm * math.sqrt(T))
+    x = min(max(x, SMILE_X_RANGE[0]), SMILE_X_RANGE[1])
+    b1, b2 = (SMILE_B1, SMILE_B2) if x < 0 else (SMILE_C1, SMILE_C2)
+    shape = max(1.0 + b1 * x + b2 * x * x, SMILE_FLOOR)
+    return max(sigma_atm * shape, 0.01)
 
 
-def strike_for_delta(S, T, r, q, sigma_atm, vix_level, target_delta, n_iter=3, call=False):
-    # Black-Scholes delta is e^(-qT) N(d1) for a call and -e^(-qT) N(-d1) for a put.
-    # target_delta is the absolute value, so only the sign of d1 differs.
+def bs_abs_delta(S, K, T, r, q, sig, call=False) -> float:
+    """|Black-Scholes delta|, used to pick strikes and for the delta stop."""
+    if T <= 0:
+        return float((S > K) if call else (S < K))
+    d1 = (math.log(S / K) + (r - q + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
+    return math.exp(-q * T) * (ndtr(d1) if call else ndtr(-d1))
+
+
+def strike_for_delta(S, T, r, q, sigma_atm, vix_level, target_delta, n_iter=None, call=False, model=None):
+    """Strike whose Black-Scholes |delta|, at that strike's own smile vol, equals target_delta.
+
+    The vol depends on the strike through the smile, so this iterates: guess a vol, solve for the
+    strike, read the vol there, repeat. Each pass shrinks the error by a factor of about 0.3 at
+    these deltas, so ten passes are far more than enough.
+    """
+    m = model or MODEL
+    if n_iter is None:
+        n_iter = 3 if m["smile"] == "linear" else 10
     z = ndtri(target_delta * math.exp(q * T))
     d1_target = z if call else -z
     sig, K = sigma_atm, S
     for _ in range(n_iter):
         K = S * math.exp((r - q + 0.5 * sig * sig) * T - d1_target * sig * math.sqrt(T))
-        sig = iv(S, K, T, sigma_atm, vix_level)
+        sig = iv(S, K, T, sigma_atm, vix_level, r, q, m)
     return K
 
 
 # ------------------------------------------------------------------- pricer
-def bin_tree(S, K, T, r, sig, q, N, american=True,call = False):
+def _short_cuts(S, K, T, r, sig, q, call):
     if T <= 0:
         return max(S - K, 0.0) if call else max(K - S, 0.0)
     if sig <= 0:
         fwd = S * math.exp((r - q) * T)
         payoff = max(fwd - K, 0.0) if call else max(K - fwd, 0.0)
         return math.exp(-r * T) * payoff
+    return None
 
+
+def crr_tree(S, K, T, r, sig, q, N, american=True, call=False):
+    """Cox-Ross-Rubinstein: u = e^(sigma sqrt(dt)), d = 1/u, probability set from the forward."""
+    sc = _short_cuts(S, K, T, r, sig, q, call)
+    if sc is not None:
+        return sc
     dt_step = T / N
     u = math.exp(sig * dt_step ** 0.5)
     d = 1.0 / u
@@ -95,7 +145,7 @@ def bin_tree(S, K, T, r, sig, q, N, american=True,call = False):
 
     j = np.arange(N + 1)
     if call:
-        V = np.maximum(S*u**(2*j - N) - K, 0.0)
+        V = np.maximum(S * u ** (2 * j - N) - K, 0.0)
     else:
         V = np.maximum(K - S * u ** (2 * j - N), 0.0)
 
@@ -110,13 +160,99 @@ def bin_tree(S, K, T, r, sig, q, N, american=True,call = False):
     return float(V[0])
 
 
+bin_tree = crr_tree   # the original name, kept for the golden tests
+
+
+def _peizer_pratt(z: float, n: int) -> float:
+    """Peizer-Pratt method 2: a binomial probability that matches N(z) closely for n steps."""
+    a = z / (n + 1.0 / 3.0 + 0.1 / (n + 1.0))
+    return 0.5 + math.copysign(0.5, z) * math.sqrt(1.0 - math.exp(-a * a * (n + 1.0 / 6.0)))
+
+
+def lr_tree(S, K, T, r, sig, q, N, american=True, call=False):
+    """Leisen-Reimer (1996) binomial tree.
+
+    CRR spaces its nodes by volatility alone, so the strike falls at a different place between two
+    nodes every time N changes, and the error zigzags as N grows. Leisen-Reimer instead chooses the
+    up-probabilities so that the tree's probabilities of finishing in the money match N(d2) and
+    N(d1), via the Peizer-Pratt inversion. That centres the tree on the strike: the European price
+    converges smoothly at about 1/N^2 instead of 1/N. It needs an odd number of steps.
+    """
+    sc = _short_cuts(S, K, T, r, sig, q, call)
+    if sc is not None:
+        return sc
+    if N % 2 == 0:
+        N += 1
+    dt_step = T / N
+    sq = sig * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sig * sig) * T) / sq
+    d2 = d1 - sq
+    p = _peizer_pratt(d2, N)
+    p_star = _peizer_pratt(d1, N)
+    if not (1e-10 < p < 1 - 1e-10 and 1e-10 < p_star < 1 - 1e-10):
+        # Far from the money with tiny vol, d1 and d2 are so large that p rounds to 0 or 1 and the
+        # tree has no width. The option is then worth its discounted forward intrinsic value to
+        # many decimals, which CRR gets right, so it is used for these cases only.
+        return crr_tree(S, K, T, r, sig, q, N, american=american, call=call)
+    growth = math.exp((r - q) * dt_step)
+    u = growth * p_star / p
+    d = (growth - p * u) / (1.0 - p)
+    disc = math.exp(-r * dt_step)
+
+    j = np.arange(N + 1)
+    ST = S * u ** j * d ** (N - j)          # j = number of up moves
+    V = np.maximum(ST - K, 0.0) if call else np.maximum(K - ST, 0.0)
+    Sn = ST
+    for m in range(N - 1, -1, -1):
+        V = disc * (p * V[1:] + (1.0 - p) * V[:-1])
+        if american:
+            Sn = Sn[:-1] / d                # node prices one step earlier
+            V = np.maximum(V, Sn - K) if call else np.maximum(V, K - Sn)
+    return float(V[0])
+
+
+def price_option(S, K, T, r, sig, q, call=False, american=True, model=None):
+    m = model or MODEL
+    tree = lr_tree if m["tree"] == "lr" else crr_tree
+    return tree(S, K, T, r, sig, q, m["steps"], american=american, call=call)
+
+
 # ----------------------------------------------------------------- backtest
 def backtest(df, capital=500_000, dte=45, target_delta=0.50,
              profit_target=0.70, loss_mult=2.0, cost_per_side=0.01,
-             r=0.03, q=0.012, N=50, record_daily = False, side="put"):
+             r=0.03, q=0.012, record_daily=False, side="put",
+             entry="vix_cap", vix_cap=None, time_exit=None, stop="loss", stop_delta=0.50,
+             collateral="overlay", model=None):
+    """Sell one option series at a time, mark it every day, close it, and sell the next.
 
+    entry       "vix_cap" sell only when VIX <= vix_cap (19 for puts, 22 for calls, the original rule)
+                "always"  sell whenever flat
+                "vrp"     sell only when model at-the-money vol is above 20-day realised vol
+                "term"    skip days when VIX9D > VIX (short-dated fear above 30-day: backwardation)
+                rules can be combined with "+", e.g. "vrp+term"
+    stop        "loss"    close when the mark-to-market loss reaches loss_mult x the premium
+                "delta"   close when the option's |delta| reaches stop_delta
+    time_exit   close when this fraction of the option's life is left (None = hold to expiry)
+    collateral  "overlay" hold SPY with the whole account and sell puts (or covered calls) on it
+                "cash"    hold cash at the risk-free rate and sell as many puts as it secures
+    """
+    m = model or MODEL
     if side not in ("put", "call"):
         raise ValueError(f"side must be 'put' or 'call', got {side!r}")
+    if collateral not in ("overlay", "cash"):
+        raise ValueError(f"collateral must be 'overlay' or 'cash', got {collateral!r}")
+    if side == "call" and collateral == "cash":
+        raise ValueError("a call is covered by shares, so it needs collateral='overlay'")
+    if vix_cap is None:
+        vix_cap = 19.0 if side == "put" else 22.0
+    rules = set(entry.split("+"))
+    unknown = rules - {"vix_cap", "always", "vrp", "term"}
+    if unknown:
+        raise ValueError(f"unknown entry rule(s): {sorted(unknown)}")
+    if stop not in ("loss", "delta"):
+        raise ValueError(f"stop must be 'loss' or 'delta', got {stop!r}")
+    call = side == "call"
+
     df = df.sort_values("Date").reset_index(drop=True)
     dates = pd.to_datetime(df["Date"]).to_numpy()
     spy = df["spy_close"].to_numpy(dtype=float)
@@ -124,80 +260,68 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
     n = len(df)
     div = df["spy_div"].to_numpy(float) if "spy_div" in df.columns else np.zeros(n)
     vix9d = df["vix9d_close"].to_numpy(float) if "vix9d_close" in df.columns else vix.copy()
+    # realised vol over the last 20 sessions, today's close included (decisions are made at the close)
+    rv20 = (pd.Series(np.log(spy)).diff().rolling(20).std() * math.sqrt(252)).to_numpy()
 
-    def atm_vol_at(i, T_years):
-        return model_atm(vix9d[i], vix[i], T_years)
-
-    shares = math.floor(capital / spy[0])
-    contracts = shares // 100
-    cash = capital - shares * spy[0]
+    if collateral == "overlay":
+        shares = math.floor(capital / spy[0])
+        cash = capital - shares * spy[0]
+    else:
+        shares, cash = 0.0, float(capital)
+    contracts = 0
 
     pos = None
     equity = np.empty(n)
-    trades = []
-    daily = []
-    rf_d = (1+r)**(1/252)-1
+    trades, daily = [], []
+    rf_d = (1 + r) ** (1 / 252) - 1
 
-    
+    def days_left(i):
+        return (pos["expiry"] - dates[i]) / np.timedelta64(1, "D")
 
-    def value_now(i):
-        T = max((pos["expiry"] - dates[i]) / np.timedelta64(1, "D"), 0) / 365.0
-        sig = iv(spy[i], pos["strike"], T, atm_vol_at(i,T), vix[i])
-        return bin_tree(spy[i], pos["strike"], T, r, sig, q, N, call=pos.get("call", False))
+    def mark(i):
+        """Model value and vol of the open option today."""
+        T = max(days_left(i), 0) / 365.0
+        sig = iv(spy[i], pos["strike"], T, model_atm(vix9d[i], vix[i], T, m), vix[i], r, q, m)
+        return price_option(spy[i], pos["strike"], T, r, sig, q, call=call, model=m), sig, T
 
-    def open_call(i, vix_high=22):
-        # Covered call, mirroring open_put: re-level shares, pick the call strike
-        # from the target delta, and flag the position so value_now prices a call.
+    def can_open(i):
+        ok = True
+        if "vix_cap" in rules:
+            ok &= vix[i] <= vix_cap
+        if "vrp" in rules:
+            ok &= bool(np.isfinite(rv20[i])) and model_atm(vix9d[i], vix[i], dte / 365.0, m) > rv20[i]
+        if "term" in rules:
+            ok &= vix9d[i] <= vix[i]
+        return ok
+
+    def open_position(i):
         nonlocal cash, pos, contracts, shares
-        if vix[i] > vix_high:
+        T = dte / 365.0
+        sig_atm = model_atm(vix9d[i], vix[i], T, m)
+        K = strike_for_delta(spy[i], T, r, q, sig_atm, vix[i], target_delta, call=call, model=m)
+        sig = iv(spy[i], K, T, sig_atm, vix[i], r, q, m)
+        price = price_option(spy[i], K, T, r, sig, q, call=call, model=m)
+        if collateral == "overlay":
+            # re-level the share position to the whole account, then write one option per 100 shares
+            target = math.floor((cash + shares * spy[i]) / spy[i])
+            cash -= (target - shares) * spy[i]
+            shares = target
+            contracts = int(shares) // 100
+        else:
+            # every put fully secured by cash: strike x 100 per contract
+            contracts = int(cash // (K * 100))
+        if contracts == 0:
             return None
-        frac = 1.0
-        equity_now = cash + shares * spy[i]
-        target = math.floor(equity_now * frac / spy[i])
-        cash -= (target - shares) * spy[i]
-        shares = target
-        contracts = int(shares) // 100
-        sig_atm = atm_vol_at(i, dte / 365.0)
-        K = strike_for_delta(spy[i], dte / 365.0, r, q,
-                             sig_atm, vix[i], target_delta, call=True)
-        sig = iv(spy[i], K, dte / 365.0, sig_atm, vix[i])
-        price = bin_tree(spy[i], K, dte / 365.0, r, sig, q, N, call=True)
         premium = price * 100 * contracts
         fee = cost_per_side * premium
         cash += premium - fee
-        pos = {"call": True, "entry_price": price, "strike": K, "open_date": dates[i],
-               "expiry": dates[i] + np.timedelta64(dte, "D"),
-               "premium": premium, "open_fee": fee}
+        pos = {"call": call, "entry_price": price, "strike": K, "open_date": dates[i],
+               "expiry": dates[i] + np.timedelta64(dte, "D"), "premium": premium, "open_fee": fee,
+               "entry_delta": bs_abs_delta(spy[i], K, T, r, q, sig, call)}
         return {"opened_strike": round(K, 2), "sold_px": round(price, 2), "premium_in_$": round(premium, 2)}
 
-    def open_put(i, vix_high=19):
-        nonlocal cash, pos, contracts,shares
-        if vix[i]>vix_high:
-            return None
-        frac = 1.0
-        equity_now = cash + shares*spy[i]
-        target = math.floor(equity_now*frac/spy[i])
-        cash -= (target-shares)*spy[i]
-        shares = target
-        contracts = int(shares)//100
-        sig_atm = atm_vol_at(i,dte/365.0)
-        K = strike_for_delta(spy[i], dte / 365.0, r, q,
-                             sig_atm, vix[i], target_delta)
-        sig = iv(spy[i], K, dte / 365.0, sig_atm, vix[i])
-        price = bin_tree(spy[i], K, dte / 365.0, r, sig, q, N)
-        premium = price * 100 * contracts
-        fee = cost_per_side * premium
-        cash += premium - fee
-        pos = {"entry_price": price, "strike": K, "open_date": dates[i],
-               "expiry": dates[i] + np.timedelta64(dte, "D"),
-               "premium": premium, "open_fee": fee}
-        
-        return {"opened_strike":round(K,2),"sold_px":round(price,2),"premium_in_$":round(premium,2)}
-        
-        
-    def close_position(i, reason):
+    def close_position(i, reason, val):
         nonlocal cash, pos
-        val = value_now(i)
         close_val = val * 100 * contracts
         fee = cost_per_side * close_val
         cash -= close_val + fee
@@ -205,46 +329,52 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
         net = gross - pos["open_fee"] - fee
         trades.append({"open": pd.Timestamp(pos["open_date"]).date(),
                        "close": pd.Timestamp(dates[i]).date(), "reason": reason,
-                       "entry_px": round(pos["entry_price"], 2),
-                       "exit_px": round(val, 2),
-                       "vix_at_close": round(vix[i], 1),
-                       "gross_$": round(gross), "net_$": round(net)})
+                       "days_held": int((dates[i] - pos["open_date"]) / np.timedelta64(1, "D")),
+                       "strike": round(pos["strike"], 2), "entry_delta": round(pos["entry_delta"], 3),
+                       "entry_px": round(pos["entry_price"], 2), "exit_px": round(val, 2),
+                       "vix_at_open": None, "vix_at_close": round(vix[i], 1),
+                       "contracts": contracts, "gross_$": round(gross), "net_$": round(net)})
         pos = None
-        return {"closed_reason":reason,"buyback_px":round(val,2),"realized_pl_$":round(net)}
+        return {"closed_reason": reason, "buyback_px": round(val, 2), "realized_pl_$": round(net)}
 
     for i in range(n):
-
-        cash *= (1 + rf_d) 
-        if div[i] > 0:
+        cash *= (1 + rf_d)
+        if div[i] > 0 and shares:
             shares += (shares * div[i]) / spy[i]
         closed = opened = None
+        val = None
         if pos is not None:
-            val = value_now(i)
-            mtm_loss = (val - pos["entry_price"]) * 100 * contracts
-            if mtm_loss >= loss_mult * pos["premium"]:
-                closed = close_position(i, "loss_cap")
+            val, sig, T = mark(i)
+            left = days_left(i)
+            if stop == "loss":
+                stopped = (val - pos["entry_price"]) * 100 * contracts >= loss_mult * pos["premium"]
+            else:
+                stopped = left > 0 and bs_abs_delta(spy[i], pos["strike"], T, r, q, sig, call) >= stop_delta
+            if stopped:
+                closed = close_position(i, "stop", val)
             elif val <= (1 - profit_target) * pos["entry_price"]:
-                closed = close_position(i, "profit_target")
-            elif (pos["expiry"] - dates[i]) / np.timedelta64(1, "D") <= 0:
-                closed = close_position(i, "expiry")
-        if pos is None:
-            opened = open_put(i) if side == "put" else open_call(i)
+                closed = close_position(i, "profit_target", val)
+            elif time_exit is not None and 0 < left <= time_exit * dte:
+                closed = close_position(i, "time_exit", val)
+            elif left <= 0:
+                closed = close_position(i, "expiry", val)
+            if closed:
+                val = None
+        if pos is None and can_open(i):
+            opened = open_position(i)
+            if opened:
+                val = pos["entry_price"]
 
-        liab = value_now(i) * 100 * contracts if pos is not None else 0.0
+        liab = val * 100 * contracts if pos is not None else 0.0
         equity[i] = cash + shares * spy[i] - liab
 
         if record_daily:
-            row = {"date": pd.Timestamp(dates[i]).date(),
-                   "spy": round(spy[i], 2), "vix": round(vix[i], 1)}
+            row = {"date": pd.Timestamp(dates[i]).date(), "spy": round(spy[i], 2), "vix": round(vix[i], 1)}
             if pos is not None:
-                cur = liab / (100 * contracts)
-                row.update({
-                    "strike": round(pos["strike"], 2),
-                    "sold_at": round(pos["entry_price"], 2),
-                    "put_val_now": round(cur, 2),
-                    "unreal_pl_$": round((pos["entry_price"] - cur) * 100 * contracts),
-                    "dte_left": int((pos["expiry"] - dates[i]) / np.timedelta64(1, "D")),
-                })
+                row.update({"strike": round(pos["strike"], 2), "sold_at": round(pos["entry_price"], 2),
+                            "option_val_now": round(val, 2),
+                            "unreal_pl_$": round((pos["entry_price"] - val) * 100 * contracts),
+                            "dte_left": int(days_left(i))})
             if closed:
                 row.update(closed)
             if opened:
@@ -253,21 +383,27 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
             daily.append(row)
 
     eq = pd.Series(equity, index=pd.to_datetime(df["Date"]))
-    cols = ["date", "spy", "vix", "strike", "sold_at", "put_val_now",
+    cols = ["date", "spy", "vix", "strike", "sold_at", "option_val_now",
             "unreal_pl_$", "dte_left", "closed_reason", "buyback_px",
-            "realized_pl_$", "opened_strike", "sold_px", "premium_in_$",
-            "equity_$"]
-    daily_df = (pd.DataFrame(daily).reindex(columns=cols)
-                if daily else pd.DataFrame(columns=cols))
-    
-    return eq, pd.DataFrame(trades),daily_df, {"shares": shares, "contracts": contracts}
+            "realized_pl_$", "opened_strike", "sold_px", "premium_in_$", "equity_$"]
+    daily_df = pd.DataFrame(daily).reindex(columns=cols) if daily else pd.DataFrame(columns=cols)
+    tr = pd.DataFrame(trades)
+    if len(tr):
+        tr = tr.drop(columns=["vix_at_open"])
+    return eq, tr, daily_df, {"shares": shares, "contracts": contracts}
 
 
 # ------------------------------------------------------------------ metrics
+def sharpe_of(eq: pd.Series, r=0.03) -> float:
+    ret = eq.pct_change().dropna()
+    rf_d = (1 + r) ** (1 / 252) - 1
+    return float((ret.mean() - rf_d) / ret.std() * math.sqrt(252))
+
+
 def metrics(eq, df, capital=500_000, r=0.03):
     drip = (1 + df.get("spy_div", 0) / df["spy_close"]).cumprod()
     bench = pd.Series((df["spy_close"] * drip).to_numpy(float),
-                  index=pd.to_datetime(df["Date"]))
+                      index=pd.to_datetime(df["Date"]))
     bench_final = capital * (bench.iloc[-1] / bench.iloc[0])
     both = pd.concat([eq.pct_change(), bench.pct_change()], axis=1).dropna()
     ret, bret = both.iloc[:, 0], both.iloc[:, 1]
@@ -301,21 +437,21 @@ def run_sweep(df, deltas, dtes, **backtest_kwargs):
     for d in deltas:
         for t in dtes:
             eq, trades, _, _ = backtest(df, dte=t, target_delta=d, **backtest_kwargs)
-            m = metrics(eq, df)
+            mt = metrics(eq, df)
             rc = (trades["reason"].value_counts(normalize=True)
                   if len(trades) else pd.Series(dtype=float))
-            m.update({
+            mt.update({
                 "n_trades":       len(trades),
-                "win_rate_%":     round((trades["net_$"] > 0).mean() * 100, 1)
-                                  if len(trades) else np.nan,
-                "pct_loss_cap":   round(rc.get("loss_cap", 0) * 100, 1),
+                "win_rate_%":     round((trades["net_$"] > 0).mean() * 100, 1) if len(trades) else np.nan,
+                "pct_stop":       round(rc.get("stop", 0) * 100, 1),
                 "pct_profit_tgt": round(rc.get("profit_target", 0) * 100, 1),
+                "pct_time_exit":  round(rc.get("time_exit", 0) * 100, 1),
                 "pct_expiry":     round(rc.get("expiry", 0) * 100, 1),
             })
-            rows[(d, t)] = m
-            print(f"delta={d:.2f}  dte={t:3d}  sharpe={m['sharpe']:5.2f}  "
-                  f"sortino={m['sortino']:5.2f}  mdd={m['max_drawdown_%']:6.1f}%  "
-                  f"trades={m['n_trades']}")
+            rows[(d, t)] = mt
+            print(f"delta={d:.2f}  dte={t:3d}  sharpe={mt['sharpe']:5.2f}  "
+                  f"sortino={mt['sortino']:5.2f}  mdd={mt['max_drawdown_%']:6.1f}%  "
+                  f"trades={mt['n_trades']}", flush=True)
     res = pd.DataFrame(rows).T
     res.index.names = ["delta", "dte"]
     return res
@@ -335,8 +471,11 @@ def save_outputs(res, trades, daily, m, out_dir=OUT):
     print(f"\nSaved sweep, trades, blotter and metrics to {out_dir}")
 
 
-def load_data(start="2010-01-01", end=None):
-    """Daily SPY, VIX and VIX9D closes and SPY dividends from Yahoo."""
+def load_data(start="2010-01-01", end=None, cache=True):
+    """Daily SPY, VIX and VIX9D closes and SPY dividends from Yahoo, cached once per day."""
+    path = os.path.join(CACHE, f"spy_vix_{start}_{end or pd.Timestamp.today().date()}.parquet")
+    if cache and os.path.exists(path):
+        return pd.read_parquet(path)
     import yfinance as yf
     data = yf.download(["SPY", "^VIX", "^VIX9D"], start=start, end=end,
                        auto_adjust=False, actions=True, progress=False)
@@ -358,6 +497,9 @@ def load_data(start="2010-01-01", end=None):
     n_fb = int(close["^VIX9D"].reindex(core.index).isna().sum())
     print(f"{out['Date'].iloc[0].date()} to {out['Date'].iloc[-1].date()}: {len(out)} days, "
           f"VIX9D missing on {n_fb} (VIX used instead)")
+    if cache:
+        os.makedirs(CACHE, exist_ok=True)
+        out.to_parquet(path)
     return out
 
 
@@ -366,19 +508,30 @@ if __name__ == "__main__":
     ap.add_argument("--start", default="2010-01-01")
     ap.add_argument("--end", default=None, help="exclusive; default is today")
     ap.add_argument("--side", default="put", choices=["put", "call"])
-    ap.add_argument("--delta", type=float, default=0.30, help="target delta of the detailed run")
-    ap.add_argument("--dte", type=int, default=14, help="days to expiry of the detailed run")
-    ap.add_argument("--atm-scale", type=float, default=ATM_SCALE)
-    ap.add_argument("--skew-base", type=float, default=SKEW_BASE)
+    ap.add_argument("--delta", type=float, default=0.20, help="target delta of the detailed run")
+    ap.add_argument("--dte", type=int, default=30, help="days to expiry of the detailed run")
+    ap.add_argument("--legacy", action="store_true", help="original model: CRR, 50 steps, flat skew")
+    ap.add_argument("--entry", default="vix_cap")
+    ap.add_argument("--profit-target", type=float, default=0.70)
+    ap.add_argument("--time-exit", type=float, default=None)
+    ap.add_argument("--stop", default="loss", choices=["loss", "delta"])
+    ap.add_argument("--collateral", default="overlay", choices=["overlay", "cash"])
+    ap.add_argument("--atm-scale", type=float, default=None)
     a = ap.parse_args()
-    ATM_SCALE, SKEW_BASE = a.atm_scale, a.skew_base
+    if a.legacy:
+        MODEL.update(LEGACY)
+    if a.atm_scale is not None:
+        MODEL["atm_scale"] = a.atm_scale
+    rules = dict(side=a.side, entry=a.entry, profit_target=a.profit_target, time_exit=a.time_exit,
+                 stop=a.stop, collateral=a.collateral)
 
     DELTAS = [0.15, 0.20, 0.30]                # |delta| of the option sold
     DTES = [14, 21, 30, 45]                    # calendar days
 
     df = load_data(a.start, a.end)
-    res = run_sweep(df, DELTAS, DTES, side=a.side)
-    eq, trades, daily, info = backtest(df, dte=a.dte, target_delta=a.delta, record_daily=True, side=a.side)
+    print(f"model: {MODEL}; rules: {rules}")
+    res = run_sweep(df, DELTAS, DTES, **rules)
+    eq, trades, daily, info = backtest(df, dte=a.dte, target_delta=a.delta, record_daily=True, **rules)
     m = metrics(eq, df)
     m["n_trades"] = len(trades)
     print(f"\ndetailed run: delta {a.delta}, {a.dte} days: " + ", ".join(f"{k} {v}" for k, v in m.items()))

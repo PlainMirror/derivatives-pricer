@@ -1,4 +1,6 @@
-"""How far is the back test's pricing model from real option prices?
+"""How far was the ORIGINAL pricing model (VIX as at-the-money vol, flat linear skew) from real prices?
+
+smile_fit.py is the fit and the out-of-sample check of the model that replaced it.
 
     python validate_surface.py cache/SPY_2026-09-24.json 2026-09-24
 
@@ -28,7 +30,7 @@ import pandas as pd
 from scipy.optimize import brentq
 from scipy.special import ndtr
 
-from pricer import atm_vol, bin_tree, iv, skew_slope
+from pricer import LEGACY, atm_vol, bin_tree, iv, skew_slope
 
 R, Q, N_BACKTEST, N_FINE = 0.03, 0.012, 50, 200      # the back test's own rate, dividend yield and tree size
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
@@ -74,7 +76,7 @@ def main(path: str, day: str, spot: float | None = None) -> pd.DataFrame:
     d = d[d["K"] < S].copy()
     d["T"] = d["dte"] / 365.0
     d["atm_model"] = [atm_vol(vix9d, vix, T) for T in d["T"]]
-    d["iv_model"] = [iv(S, K, T, a, vix) for K, T, a in zip(d["K"], d["T"], d["atm_model"])]
+    d["iv_model"] = [iv(S, K, T, a, vix, model=LEGACY) for K, T, a in zip(d["K"], d["T"], d["atm_model"])]
     d["px_model"] = [bin_tree(S, K, T, R, s, Q, N_BACKTEST) for K, T, s in zip(d["K"], d["T"], d["iv_model"])]
     d["iv_real"] = [real_iv(p, S, K, T) for p, K, T in zip(d["mid"], d["K"], d["T"])]
     d = d.dropna(subset=["iv_real"])

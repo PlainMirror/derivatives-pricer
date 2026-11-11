@@ -10,7 +10,14 @@ from scipy.special import ndtr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pricer import bin_tree, iv, strike_for_delta
+from functools import partial
+
+import pricer
+from pricer import LEGACY, bin_tree
+
+# These tests pin the ORIGINAL model (CRR tree, flat linear skew), so they call it explicitly.
+iv = partial(pricer.iv, model=LEGACY)
+strike_for_delta = partial(pricer.strike_for_delta, model=LEGACY)
 
 S, R, Q = 400.0, 0.03, 0.012
 VOLS = [0.12, 0.20, 0.30, 0.45]
