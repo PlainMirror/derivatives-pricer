@@ -150,6 +150,22 @@ def main(path: str, day: str, S: float) -> dict:
     print(f"   all {len(p)}: median error fitted {p['err_new'].median():+.1f}%, original {p['err_old'].median():+.1f}%; "
           f"median absolute error fitted {p['err_new'].abs().median():.1f}%, original {p['err_old'].abs().median():.1f}%")
 
+    # ---- and the calls calls_study.py buys (0.30 to 0.70 delta), on the check expiries. In-the-money
+    # calls are below the forward, so their vol is read from the put wing of the same smile, and their
+    # price comes from the out-of-the-money put at that strike through put-call parity.
+    cq = d[~d["fit"]].copy()
+    cq["civ"] = cq["iv"]
+    cq["cdelta"] = [bs_abs_delta(S, K, T, R, Q, s, True) for K, T, s in zip(cq["K"], cq["T"], cq["civ"])]
+    cq = cq[(cq["cdelta"] >= 0.20) & (cq["cdelta"] <= 0.80)].copy()
+    cq["civ_new"] = [iv(S, K, T, scale * a, vix, R, Q, fitted) for K, T, a in zip(cq["K"], cq["T"], cq["atm_vix"])]
+    cq["cpx_real"] = [pricer.price_option(S, K, T, R, s, Q, call=True) for K, T, s in zip(cq["K"], cq["T"], cq["civ"])]
+    cq["cpx_new"] = [pricer.price_option(S, K, T, R, s, Q, call=True, model=fitted) for K, T, s in zip(cq["K"], cq["T"], cq["civ_new"])]
+    cq["cerr"] = 100 * (cq["cpx_new"] / cq["cpx_real"] - 1)
+    cq["delta_bucket"] = pd.cut(cq["cdelta"], [0.20, 0.40, 0.60, 0.80], labels=["0.30", "0.50", "0.70"])
+    ct = cq.groupby("delta_bucket", observed=True).agg(n=("K", "size"), fitted_err_pct=("cerr", "median"))
+    print("\n5. calls the long-call study buys, check expiries: fitted model price against the market, %")
+    print(ct.round(1).to_string())
+
     out = {"day": day, "spot": S, "vix": vix, "vix9d": vix9d, "atm_scale": round(scale, 4),
            "b1": round(float(b1), 4), "b2": round(float(b2), 4), "c1": round(float(c1), 4), "c2": round(float(c2), 4),
            "check_rmse_volpts": {"fitted": rmse(c["iv_new"] - c["iv"]), "original": rmse(c["iv_old"] - c["iv"])},

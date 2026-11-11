@@ -1,6 +1,6 @@
 # Derivatives Pricer and Back Tester
 
-I built this to price American options with a binomial tree and to back test a simple idea: hold SPY, and sell an out-of-the-money put against it every couple of weeks. The first version said the idea worked, with a Sharpe ratio of 0.83 for the best setting. Most of this project ended up being about whether that number was real, and the answer is that it mostly came from how I was pricing the options.
+I built this to price American options with a binomial tree and to back test a simple idea: hold SPY, and sell an out-of-the-money put against it every couple of weeks. Later I tested the opposite trade too, buying calls. The first version said the idea worked, with a Sharpe ratio of 0.83 for the best setting. Most of this project ended up being about whether that number was real, and the answer is that it mostly came from how I was pricing the options.
 
 Research code. It places no orders and is not financial advice.
 
@@ -94,6 +94,29 @@ Taking the shares out shows the option trade on its own. Cash-secured puts (the 
 
 In 2010 to 2017 these were 0.14 to 0.94. From 2018 on every one of them is negative (-0.04 to -0.41). The later period has February 2018, March 2020, 2022 and April 2025, and about 17% to 21% of trades end on the stop. (Note: the CBOE PutWrite index, which sells at-the-money puts monthly with no stop, had a Sharpe of 0.39 over the same dates when measured against the same flat 3%.)
 
+## What about buying calls instead? (`calls_study.py`)
+
+The other side of the same question: if selling insurance doesn't pay, does buying upside? The rules were fixed before the first run. Buy a call whenever flat, sized to the same SPY exposure as the account (delta x 100 x spot per contract equals the account value, and the rest sits in cash at 3%), and close it at +100% of the premium, at -50%, or when a third of its life is left.
+
+| | Total return | CAGR | Sharpe | Sharpe 2010-17 | Sharpe 2018-26 | Max drawdown |
+|---|---|---|---|---|---|---|
+| best call: 0.70 delta, 45 days | 656% | 12.8% | 0.63 | 0.59 | 0.65 | -29.4% |
+| 0.50 delta, 30 days | 496% | 11.2% | 0.53 | 0.34 | 0.66 | -27.3% |
+| worst call: 0.30 delta, 30 days | 240% | 7.5% | 0.35 | 0.25 | 0.42 | -26.1% |
+| best put on SPY: 0.20 delta, 21 days | 896% | 14.6% | 0.66 | 0.79 | 0.57 | -36.3% |
+| SPY, buy and hold | 801% | 13.9% | 0.68 | 0.74 | 0.64 | -33.7% |
+
+(2010 to November 10, 2026, from $500,000. The best and worst rows are picked after the fact from 12 settings each, so read them as a range. Full grid in `results/calls_study.md`.)
+
+A few things stand out:
+
+- Every call setting earns less than SPY, between 7.5% and 12.8% a year, and every one has a lower Sharpe. The deeper in the money the call, the better it does, since a 0.70-delta call is mostly stock and carries less time value to lose.
+- The calls do have smaller drawdowns (-23% to -31%), because a call can't lose more than its premium, and the stop caps that at half.
+- About half the trades end on the -50% stop (36% for the 0.70-delta calls, up to 62% for the 0.30-delta ones), and only 15% to 35% reach the +100% target.
+- Unlike the puts, the calls did better from 2018 on than before. The later period had the bigger rallies (2020 to 2021, 2023 to 2024), which is what a long call needs.
+
+(Note: checked on the same held-back expiries as the puts, the fitted model prices 0.50 and 0.70-delta calls within 2% of the market, but 0.30-delta calls 11% too cheap. That flatters buying them, so their real results would be worse than the table.)
+
 So the "edge" in the first version was mostly the pricing model overcharging for the puts it sold. Whatever is left is the variance risk premium, and it is small and unreliable at these deltas once the losses in sell-offs are counted.
 
 ## Checking the pricer
@@ -127,7 +150,9 @@ python convergence.py                     # Leisen-Reimer against CRR
 python smile_fit.py cache/SPY_2026-09-24.json 2026-09-24 767.29
 python rules_study.py                     # the rule changes, both halves (about 2 minutes on 6 cores)
 python pricer.py                          # the sweep and one detailed run with the fitted model
+python calls_study.py                     # buying calls against selling puts, same model and dates
 python pricer.py --collateral cash        # cash-secured puts
+python pricer.py --side long_call --entry always --time-exit 0.333   # one long-call sweep
 python pricer.py --legacy                 # the original model
 ```
 
@@ -139,6 +164,7 @@ python pricer.py --legacy                 # the original model
 | `smile_fit.py` | fits the at-the-money level and the smile to a real chain, and checks them on held-back expiries |
 | `validate_surface.py` | how far the original model was from the same chain |
 | `rules_study.py` | the pre-registered rule changes, scored in both halves |
+| `calls_study.py` | buying calls next to selling puts |
 | `convergence.py` | the tree comparison above |
 | `tests/` | the 25 tests |
 | `results/` | the original model's sweep, the smile fit, and the rules study |

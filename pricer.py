@@ -222,7 +222,7 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
              profit_target=0.70, loss_mult=2.0, cost_per_side=0.01,
              r=0.03, q=0.012, record_daily=False, side="put",
              entry="vix_cap", vix_cap=None, time_exit=None, stop="loss", stop_delta=0.50,
-             collateral="overlay", model=None):
+             collateral="overlay", long_target=1.0, long_stop=0.5, model=None):
     """Sell one option series at a time, mark it every day, close it, and sell the next.
 
     entry       "vix_cap" sell only when VIX <= vix_cap (19 for puts, 22 for calls, the original rule)
@@ -235,10 +235,17 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
     time_exit   close when this fraction of the option's life is left (None = hold to expiry)
     collateral  "overlay" hold SPY with the whole account and sell puts (or covered calls) on it
                 "cash"    hold cash at the risk-free rate and sell as many puts as it secures
+    side        "put" or "call" sells the option; "long_call" BUYS calls instead. A long call is sized
+                to the same SPY exposure as the account (delta x 100 x spot per contract = equity), the
+                rest stays in cash, and it closes at a gain of long_target or a loss of long_stop (as
+                fractions of the premium paid), or on time_exit or expiry.
     """
     m = model or MODEL
-    if side not in ("put", "call"):
-        raise ValueError(f"side must be 'put' or 'call', got {side!r}")
+    if side not in ("put", "call", "long_call"):
+        raise ValueError(f"side must be 'put', 'call' or 'long_call', got {side!r}")
+    long = side == "long_call"
+    if long:
+        collateral = "cash"
     if collateral not in ("overlay", "cash"):
         raise ValueError(f"collateral must be 'overlay' or 'cash', got {collateral!r}")
     if side == "call" and collateral == "cash":
@@ -251,7 +258,7 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
         raise ValueError(f"unknown entry rule(s): {sorted(unknown)}")
     if stop not in ("loss", "delta"):
         raise ValueError(f"stop must be 'loss' or 'delta', got {stop!r}")
-    call = side == "call"
+    call = side in ("call", "long_call")
 
     df = df.sort_values("Date").reset_index(drop=True)
     dates = pd.to_datetime(df["Date"]).to_numpy()
@@ -301,7 +308,11 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
         K = strike_for_delta(spy[i], T, r, q, sig_atm, vix[i], target_delta, call=call, model=m)
         sig = iv(spy[i], K, T, sig_atm, vix[i], r, q, m)
         price = price_option(spy[i], K, T, r, sig, q, call=call, model=m)
-        if collateral == "overlay":
+        delta0 = bs_abs_delta(spy[i], K, T, r, q, sig, call)
+        if long:
+            # stock replacement: as much SPY exposure (delta-weighted) as the account is worth
+            contracts = int(cash // (delta0 * 100 * spy[i]))
+        elif collateral == "overlay":
             # re-level the share position to the whole account, then write one option per 100 shares
             target = math.floor((cash + shares * spy[i]) / spy[i])
             cash -= (target - shares) * spy[i]
@@ -314,18 +325,18 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
             return None
         premium = price * 100 * contracts
         fee = cost_per_side * premium
-        cash += premium - fee
+        cash += (-premium if long else premium) - fee
         pos = {"call": call, "entry_price": price, "strike": K, "open_date": dates[i],
                "expiry": dates[i] + np.timedelta64(dte, "D"), "premium": premium, "open_fee": fee,
-               "entry_delta": bs_abs_delta(spy[i], K, T, r, q, sig, call)}
+               "entry_delta": delta0}
         return {"opened_strike": round(K, 2), "sold_px": round(price, 2), "premium_in_$": round(premium, 2)}
 
     def close_position(i, reason, val):
         nonlocal cash, pos
         close_val = val * 100 * contracts
         fee = cost_per_side * close_val
-        cash -= close_val + fee
-        gross = pos["premium"] - close_val
+        cash += (close_val if long else -close_val) - fee
+        gross = (close_val - pos["premium"]) if long else (pos["premium"] - close_val)
         net = gross - pos["open_fee"] - fee
         trades.append({"open": pd.Timestamp(pos["open_date"]).date(),
                        "close": pd.Timestamp(dates[i]).date(), "reason": reason,
@@ -346,13 +357,15 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
         if pos is not None:
             val, sig, T = mark(i)
             left = days_left(i)
-            if stop == "loss":
+            if long:
+                stopped = val <= (1 - long_stop) * pos["entry_price"]
+            elif stop == "loss":
                 stopped = (val - pos["entry_price"]) * 100 * contracts >= loss_mult * pos["premium"]
             else:
                 stopped = left > 0 and bs_abs_delta(spy[i], pos["strike"], T, r, q, sig, call) >= stop_delta
             if stopped:
                 closed = close_position(i, "stop", val)
-            elif val <= (1 - profit_target) * pos["entry_price"]:
+            elif (val >= (1 + long_target) * pos["entry_price"]) if long else (val <= (1 - profit_target) * pos["entry_price"]):
                 closed = close_position(i, "profit_target", val)
             elif time_exit is not None and 0 < left <= time_exit * dte:
                 closed = close_position(i, "time_exit", val)
@@ -365,15 +378,15 @@ def backtest(df, capital=500_000, dte=45, target_delta=0.50,
             if opened:
                 val = pos["entry_price"]
 
-        liab = val * 100 * contracts if pos is not None else 0.0
-        equity[i] = cash + shares * spy[i] - liab
+        opt = val * 100 * contracts if pos is not None else 0.0
+        equity[i] = cash + shares * spy[i] + (opt if long else -opt)
 
         if record_daily:
             row = {"date": pd.Timestamp(dates[i]).date(), "spy": round(spy[i], 2), "vix": round(vix[i], 1)}
             if pos is not None:
                 row.update({"strike": round(pos["strike"], 2), "sold_at": round(pos["entry_price"], 2),
                             "option_val_now": round(val, 2),
-                            "unreal_pl_$": round((pos["entry_price"] - val) * 100 * contracts),
+                            "unreal_pl_$": round((val - pos["entry_price"]) * (1 if long else -1) * 100 * contracts),
                             "dte_left": int(days_left(i))})
             if closed:
                 row.update(closed)
@@ -419,7 +432,9 @@ def metrics(eq, df, capital=500_000, r=0.03):
     beta = np.cov(ex_s, ex_b)[0, 1] / np.var(ex_b)
     alpha_ann = (ex_s.mean() - beta * ex_b.mean()) * 252
 
+    yrs = (eq.index[-1] - eq.index[0]).days / 365.25
     return {
+        "cagr_%":               round(((eq.iloc[-1] / eq.iloc[0]) ** (1 / yrs) - 1) * 100, 2),
         "net_profit_$":         round(eq.iloc[-1] - capital),
         "total_return_%":       round((eq.iloc[-1] / capital - 1) * 100, 1),
         "excess_vs_spy_$":      round(eq.iloc[-1] - bench_final),
@@ -507,7 +522,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2010-01-01")
     ap.add_argument("--end", default=None, help="exclusive; default is today")
-    ap.add_argument("--side", default="put", choices=["put", "call"])
+    ap.add_argument("--side", default="put", choices=["put", "call", "long_call"])
     ap.add_argument("--delta", type=float, default=0.20, help="target delta of the detailed run")
     ap.add_argument("--dte", type=int, default=30, help="days to expiry of the detailed run")
     ap.add_argument("--legacy", action="store_true", help="original model: CRR, 50 steps, flat skew")
